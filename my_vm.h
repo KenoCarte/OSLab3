@@ -34,20 +34,39 @@ typedef struct {
 		unsigned long v_page;  // virtual page number
 		unsigned long p_page;  // physical page number
 	} entry[TLB_SIZE];
-    unsigned int tlb_accesses;
-    unsigned int tlb_misses;
+	unsigned int tlb_accesses;
+	unsigned int tlb_misses;
 } TLB;
 
-void initMemoryAndDisk();
-pte_t* translate(pde_t *pgdir, void *va);
-int pageMap(pde_t *pgdir, void *va, void* pa);
-int pageFault(pde_t *pgdir, void *va);
-pte_t *checkTLB(void *va);
-int addTLB(void *va, void *pa);
+typedef struct {
+	unsigned long num_pages; // Total number of pages
+	unsigned char* bitmap;   // Bitmap to track allocated pages
+} Bitmap;
 
-void myFree(void *va, int size);
-void *myMalloc(unsigned int num_bytes);
-void myWrite(void *va, void *val, int size);
-void myRead(void *va, void *val, int size);
+void initBitmap(Bitmap* bitmap, unsigned long num_pages) {
+	bitmap->num_pages = num_pages;
+	bitmap->bitmap = (unsigned char*)calloc((num_pages + 7) / 8, sizeof(unsigned char));
+}
+void setBitmap(Bitmap* bitmap, unsigned long page_num) {
+	bitmap->bitmap[page_num / 8] |= (1 << (page_num % 8));
+}
+void clearBitmap(Bitmap* bitmap, unsigned long page_num) {
+	bitmap->bitmap[page_num / 8] &= ~(1 << (page_num % 8));
+}
+bool isBitmapSet(Bitmap* bitmap, unsigned long page_num) {
+	return (bitmap->bitmap[page_num / 8] & (1 << (page_num % 8))) != 0;
+}
+
+void initMemoryAndDisk();
+pte_t* translate(pde_t* pgdir, void* va);
+int pageMap(pde_t* pgdir, void* va, void* pa);
+int pageFault(pde_t* pgdir, void* va);
+pte_t* checkTLB(void* va);
+int addTLB(void* va, void* pa);
+
+void myFree(void* va, int size);
+void* myMalloc(unsigned int num_bytes);
+void myWrite(void* va, void* val, int size);
+void myRead(void* va, void* val, int size);
 
 #endif
