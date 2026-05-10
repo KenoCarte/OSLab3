@@ -41,17 +41,21 @@ typedef struct {
 typedef struct {
 	unsigned long num_pages; // Total number of pages
 	unsigned char* bitmap;   // Bitmap to track allocated pages
+	unsigned long free_pages; // Number of free pages
 } Bitmap;
 
 void initBitmap(Bitmap* bitmap, unsigned long num_pages) {
 	bitmap->num_pages = num_pages;
 	bitmap->bitmap = (unsigned char*)calloc((num_pages + 7) / 8, sizeof(unsigned char));
+	bitmap->free_pages = num_pages;
 }
 void setBitmap(Bitmap* bitmap, unsigned long page_num) {
 	bitmap->bitmap[page_num / 8] |= (1 << (page_num % 8));
+	bitmap->free_pages--;
 }
 void clearBitmap(Bitmap* bitmap, unsigned long page_num) {
 	bitmap->bitmap[page_num / 8] &= ~(1 << (page_num % 8));
+	bitmap->free_pages++;
 }
 bool isBitmapSet(Bitmap* bitmap, unsigned long page_num) {
 	return (bitmap->bitmap[page_num / 8] & (1 << (page_num % 8))) != 0;

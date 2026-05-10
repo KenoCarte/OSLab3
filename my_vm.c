@@ -2,7 +2,7 @@
 
 #define get_pde_bits(x, pde_width) ((x) >> (ADDRESS_BITS - pde_width))
 #define get_pte_bits(x, pte_width, offset) ((x >> (offset)) & ((1UL << (pte_width)) - 1))
-#define get_offset_bits(x, offset) ((x) & ((1UL << num) - 1))
+#define get_offset_bits(x, offset_bits) ((x) & ((1UL << (offset_bits)) - 1))
 static Bitmap phys_bitmap;
 static Bitmap virt_bitmap;
 static pde_t* page_directory;
@@ -11,7 +11,10 @@ static unsigned long num_phys_pages;
 static unsigned long num_virt_pages;
 static char* physical_memory;
 static char* disk;
-
+static int is_initialized = 0;
+const int offset_bits = log2(PAGE_SIZE);
+const int pde_bits = (ADDRESS_BITS - offset_bits) / 2;
+const int pte_bits = ADDRESS_BITS - offset_bits - pde_bits;
 /*
 Function responsible for allocating and setting your simulated physical memory and disk space
 */
@@ -23,11 +26,11 @@ void initMemoryAndDisk() {
     num_virt_pages = VM_SIZE / PAGE_SIZE;
     initBitmap(&phys_bitmap, num_phys_pages);
     initBitmap(&virt_bitmap, num_virt_pages);
-    page_directory = (pde_t*)malloc(PAGE_SIZE);
-    memset(page_directory, 0, PAGE_SIZE);
+    page_directory = (pde_t*)calloc((1UL << pde_bits), sizeof(pde_t));
     memset(&tlb, 0, sizeof(TLB));
     physical_memory = (char*)malloc(PM_SIZE);
     disk = (char*)malloc(DISK_SIZE);
+    is_initialized = 1;
     //HINT: Also calculate the number of physical and virtual pages and allocate
     //virtual and physical bitmaps and initialize them
 
@@ -40,27 +43,24 @@ The function takes a virtual address and page directories starting address and
 performs translation to return the physical address
 */
 pte_t* translate(pde_t* pgdir, void* va) {
-    //HINT: Get the Page directory index (1st level) Then get the
-    //2nd-level-page table index using the virtual address.  Using the page
-    //directory index and page table index get the physical address
-    int offset_bits = log2(PAGE_SIZE);
-    int pde_bits = (ADDRESS_BITS - offset_bits) / 2;
-    int pte_bits = ADDRESS_BITS - offset_bits - pde_bits;
     unsigned long va_num = (unsigned long)va;
     unsigned long pde_index = get_pde_bits(va_num, pde_bits);
     unsigned long pte_index = get_pte_bits(va_num, pte_bits, offset_bits);
     unsigned long offset = get_offset_bits(va_num, offset_bits);
+    pte_t* tlb_entry = checkTLB(va);
+    if (tlb_entry) {
+        tlb.tlb_accesses++;
+        return tlb_entry;
+    }
+    tlb.tlb_misses++;
     if (pde_index >= (1UL << pde_bits)) return NULL;
-    pde_t pde = pgdir[pde_index];
-    if (!(pde & 0x1)) return NULL;
-    pte_t* page_table = (pte_t*)(pde & ~0xFFFUL);
+    if (!pgdir[pde_index]) return NULL;
+    pte_t* page_table = (pte_t*)pgdir[pde_index];
     if (pte_index >= (1UL << pte_bits)) return NULL;
+    if (!page_table[pte_index]) return NULL;
     pte_t pte = page_table[pte_index];
-    if (!(pte & 0x1)) return NULL;
-    unsigned long p_page = pte & ~0xFFFUL;
-    return (pte_t*)(p_page + offset);
-    //If translation not successfull
-    return NULL;
+    addTLB(va, (void*)pte);
+    return (pte_t*)(physical_memory + pte + offset);
 }
 
 
@@ -70,14 +70,19 @@ as an argument, and sets a page table entry. This function will walk the page
 directory to see if there is an existing mapping for a virtual address. If the
 virtual address is not present, then a new entry will be added
 */
-int
-pageMap(pde_t* pgdir, void* va, void* pa) {
-
-    /*HINT: Similar to translate(), find the page directory (1st level)
-    and page table (2nd-level) indices. If no mapping exists, set the
-    virtual to physical mapping */
-
-    return -1;
+int pageMap(pde_t* pgdir, void* va, void* pa) {
+    unsigned long va_num = (unsigned long)va;
+    unsigned long pde_index = get_pde_bits(va_num, pde_bits);
+    unsigned long pte_index = get_pte_bits(va_num, pte_bits, offset_bits);
+    if (pde_index >= (1UL << pde_bits)) return -1;
+    if (pte_index >= (1UL << pte_bits)) return -1;
+    if (!pgdir[pde_index]) {
+        pte_t* new_page_table = (pte_t*)calloc((1UL << pte_bits), sizeof(pte_t));
+        pgdir[pde_index] = (unsigned long)new_page_table;
+    }
+    pte_t* page_table = (pte_t*)pgdir[pde_index];
+    page_table[pte_index] = (unsigned long)pa;
+    return 0;
 }
 
 
@@ -85,15 +90,34 @@ pageMap(pde_t* pgdir, void* va, void* pa) {
 and used by the benchmark
 */
 void* myMalloc(unsigned int num_bytes) {
-
-    //HINT: If the physical memory is not yet initialized, then allocate and initialize.
-
-   /* HINT: If the page directory is not initialized, then initialize the
-   page directory. Next, using get_next_avail(), check if there are free pages. If
-   free pages are available, set the bitmaps and map a new page. Note, you will
-   have to mark which physical pages are used. */
-
-    return NULL;
+    if (!is_initialized) initMemoryAndDisk();
+    unsigned int num_pages = (num_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (num_pages == 0) return NULL;
+    unsigned long start_vpage = 0;
+    unsigned int found = 0;
+    for (unsigned long i = 0; i < num_virt_pages; i++) {
+        if (isBitmapSet(&virt_bitmap, i)) found = 0;
+        else {
+            if (!found) start_vpage = i;
+            found++;
+            if (found == num_pages) break;
+        }
+    }
+    if (found < num_pages || phys_bitmap.free_pages < num_pages) return NULL;
+    unsigned long cur_page = 0;
+    for (unsigned int i = start_vpage;i < start_vpage + num_pages;i++) {
+        for (;cur_page < num_phys_pages;cur_page++) {
+            if (!isBitmapSet(&phys_bitmap, cur_page)) break;
+        }
+        setBitmap(&virt_bitmap, i);
+        setBitmap(&phys_bitmap, cur_page);
+        void* va = (void*)(i << offset_bits);
+        void* pa = (void*)(cur_page << offset_bits);
+        pageMap(page_directory, va, pa);
+        addTLB(va, pa);
+        cur_page++;
+    }
+    return (void*)(start_vpage << offset_bits);
 }
 
 /* Responsible for releasing one or more memory pages using virtual address (va)
@@ -127,5 +151,17 @@ void myRead(void* va, void* val, int size) {
     If you are implementing TLB,  always check first the presence of translation
     in TLB before proceeding forward */
 
+
+}
+
+int pageFault(pde_t* pgdir, void* va) {
+
+}
+
+pte_t* checkTLB(void* va) {
+
+}
+
+int addTLB(void* va, void* pa) {
 
 }
