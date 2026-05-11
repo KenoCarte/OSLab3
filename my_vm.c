@@ -1,4 +1,5 @@
 #include "my_vm.h"
+#include <string.h>
 
 #define get_pde_bits(x, pde_width) ((x) >> (ADDRESS_BITS - pde_width))
 #define get_pte_bits(x, pte_width, offset) ((x >> (offset)) & ((1UL << (pte_width)) - 1))
@@ -12,6 +13,7 @@ static unsigned long num_virt_pages;
 static char* physical_memory;
 static char* disk;
 static int is_initialized = 0;
+queue page_queue;
 const int offset_bits = log2(PAGE_SIZE);
 const int pde_bits = (ADDRESS_BITS - offset_bits) / 2;
 const int pte_bits = ADDRESS_BITS - offset_bits - pde_bits;
@@ -30,6 +32,7 @@ void initMemoryAndDisk() {
     memset(&tlb, 0, sizeof(TLB));
     physical_memory = (char*)malloc(PM_SIZE);
     disk = (char*)malloc(DISK_SIZE);
+    queue_init(&page_queue);
     is_initialized = 1;
     //HINT: Also calculate the number of physical and virtual pages and allocate
     //virtual and physical bitmaps and initialize them
@@ -43,6 +46,7 @@ The function takes a virtual address and page directories starting address and
 performs translation to return the physical address
 */
 pte_t* translate(pde_t* pgdir, void* va) {
+    if (!is_initialized) initMemoryAndDisk();
     unsigned long va_num = (unsigned long)va;
     unsigned long pde_index = get_pde_bits(va_num, pde_bits);
     unsigned long pte_index = get_pte_bits(va_num, pte_bits, offset_bits);
@@ -54,10 +58,10 @@ pte_t* translate(pde_t* pgdir, void* va) {
     }
     tlb.tlb_misses++;
     if (pde_index >= (1UL << pde_bits)) return NULL;
-    if (!pgdir[pde_index]) return NULL;
+    if (!pgdir[pde_index] && pageFault(pgdir, va) == -1) return NULL;
     pte_t* page_table = (pte_t*)pgdir[pde_index];
     if (pte_index >= (1UL << pte_bits)) return NULL;
-    if (!page_table[pte_index]) return NULL;
+    if (!page_table[pte_index] && pageFault(pgdir, va) == -1) return NULL;
     pte_t pte = page_table[pte_index];
     addTLB(va, (void*)pte);
     return (pte_t*)(physical_memory + pte + offset);
@@ -71,6 +75,7 @@ directory to see if there is an existing mapping for a virtual address. If the
 virtual address is not present, then a new entry will be added
 */
 int pageMap(pde_t* pgdir, void* va, void* pa) {
+    if (!is_initialized) initMemoryAndDisk();
     unsigned long va_num = (unsigned long)va;
     unsigned long pde_index = get_pde_bits(va_num, pde_bits);
     unsigned long pte_index = get_pte_bits(va_num, pte_bits, offset_bits);
@@ -115,6 +120,7 @@ void* myMalloc(unsigned int num_bytes) {
         void* pa = (void*)(cur_page << offset_bits);
         pageMap(page_directory, va, pa);
         addTLB(va, pa);
+        queue_push(&page_queue, i);
         cur_page++;
     }
     return (void*)(start_vpage << offset_bits);
@@ -155,7 +161,34 @@ void myRead(void* va, void* val, int size) {
 }
 
 int pageFault(pde_t* pgdir, void* va) {
-
+    unsigned long va_num = (unsigned long)va;
+    unsigned long vpn = va_num >> offset_bits;
+    if (phys_bitmap.free_pages == 0) {
+        if (!page_queue.head) return -1;
+        unsigned long evict_vpn = queue_pop(&page_queue);
+        unsigned long evict_va = evict_vpn << offset_bits;
+        unsigned long evict_pde = get_pde_bits(evict_va, pde_bits);
+        unsigned long evict_pte = get_pte_bits(evict_va, pte_bits, offset_bits);
+        pte_t* pt = (pte_t*)pgdir[evict_pde];
+        unsigned long evict_ppn = pt[evict_pte] >> offset_bits;
+        memcpy(disk + evict_vpn * PAGE_SIZE,
+               physical_memory + evict_ppn * PAGE_SIZE, PAGE_SIZE);
+        pt[evict_pte] = 0;
+        clearBitmap(&phys_bitmap, evict_ppn);
+        clearBitmap(&virt_bitmap, evict_vpn);
+        invalidateTLB((void*)evict_va);
+    }
+    unsigned long cur_page = 0;
+    for (; cur_page < num_phys_pages; cur_page++) {
+        if (!isBitmapSet(&phys_bitmap, cur_page)) break;
+    }
+    if (cur_page >= num_phys_pages) return -1;
+    void* pa = (void*)(cur_page << offset_bits);
+    if (pageMap(pgdir, va, pa) == -1) return -1;
+    setBitmap(&phys_bitmap, cur_page);
+    setBitmap(&virt_bitmap, vpn);
+    queue_push(&page_queue, vpn);
+    return 0;
 }
 
 pte_t* checkTLB(void* va) {
@@ -164,4 +197,13 @@ pte_t* checkTLB(void* va) {
 
 int addTLB(void* va, void* pa) {
 
+}
+
+void invalidateTLB(void* va) {
+    unsigned long vpn = (unsigned long)va >> offset_bits;
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (tlb.entry[i].valid && tlb.entry[i].v_page == vpn) {
+            tlb.entry[i].valid = false;
+        }
+    }
 }

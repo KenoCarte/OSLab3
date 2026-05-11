@@ -61,12 +61,55 @@ bool isBitmapSet(Bitmap* bitmap, unsigned long page_num) {
 	return (bitmap->bitmap[page_num / 8] & (1 << (page_num % 8))) != 0;
 }
 
+typedef struct {
+	struct node* next;
+	unsigned long data;
+}node;
+
+typedef struct {
+	node* head;
+	node* tail;
+}queue;
+
+void queue_init(queue* q) {
+	q->head = NULL;
+	q->tail = NULL;
+}
+
+void queue_push(queue* q, unsigned long data) {
+	node* new_node = (node*)malloc(sizeof(node));
+	new_node->data = data;
+	new_node->next = NULL;
+	if (q->tail) {
+		q->tail->next = new_node;
+	} else {
+		q->head = new_node;
+	}
+	q->tail = new_node;
+}
+
+unsigned long queue_pop(queue* q) {
+	if (q->head) {
+		node* temp = q->head;
+		unsigned long data = temp->data;
+		q->head = q->head->next;
+		free(temp);
+		if (!q->head) {
+			q->tail = NULL;
+		}
+		return data;
+	}
+	return 0;
+}
+
+
 void initMemoryAndDisk();
 pte_t* translate(pde_t* pgdir, void* va);
 int pageMap(pde_t* pgdir, void* va, void* pa);
 int pageFault(pde_t* pgdir, void* va);
 pte_t* checkTLB(void* va);
 int addTLB(void* va, void* pa);
+void invalidateTLB(void* va);
 
 void myFree(void* va, int size);
 void* myMalloc(unsigned int num_bytes);
