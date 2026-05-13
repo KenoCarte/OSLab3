@@ -1,5 +1,4 @@
 #include "my_vm.h"
-#include <string.h>
 
 #define get_pde_bits(x, pde_width) ((x) >> (ADDRESS_BITS - pde_width))
 #define get_pte_bits(x, pte_width, offset) ((x >> (offset)) & ((1UL << (pte_width)) - 1))
@@ -129,10 +128,39 @@ void* myMalloc(unsigned int num_bytes) {
 /* Responsible for releasing one or more memory pages using virtual address (va)
 */
 void myFree(void* va, int size) {
-
     //Free the page table entries starting from this virtual address (va)
     // Also mark the pages free in the bitmap
     //Only free if the memory from "va" to va+size is valid
+    unsigned long va_num = (unsigned long)va;
+    unsigned long start_vpage = va_num >> offset_bits;
+    unsigned int num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (unsigned int i = 0; i < num_pages; i++) {
+        unsigned long vpage = start_vpage + i;
+        if (!isBitmapSet(&virt_bitmap, vpage)) {
+            printf("Segmentation Fault\n");
+            return;
+        }
+        invalidateTLB((void*)(vpage << offset_bits));
+        clearBitmap(&virt_bitmap, vpage);
+        unsigned long pde_index = get_pde_bits(vpage << offset_bits, pde_bits);
+        unsigned long pte_index = get_pte_bits(vpage << offset_bits, pte_bits, offset_bits);
+        pte_t* page_table = (pte_t*)page_directory[pde_index];
+        unsigned long ppn = page_table[pte_index] >> offset_bits;
+        clearBitmap(&phys_bitmap, ppn);
+        page_table[pte_index] = 0;
+        int count = 1 << (pte_bits);
+        bool ept = true;
+        for (int j = 0; j < count; j++) {
+            if (page_table[j]) {
+                ept = false;
+                break;
+            }
+        }
+        if (ept) {
+            free(page_table);
+            page_directory[pde_index] = 0;
+        }
+    }
 }
 
 
@@ -145,7 +173,19 @@ void myWrite(void* va, void* val, int size) {
        the contents of "val" to a physical page. NOTE: The "size" value can be larger
        than one page. Therefore, you may have to find multiple pages using translate()
        function.*/
-
+    while (size) {
+        unsigned long offset = (unsigned long)va & (PAGE_SIZE - 1);
+        unsigned long to_write = PAGE_SIZE - offset < size ? PAGE_SIZE - offset : size;
+        size -= to_write;
+        pte_t* pte = translate(page_directory, va);
+        if (!pte) {
+            printf("Segmentation Fault\n");
+            return;
+        }
+        memcpy((char*)physical_memory + (*pte & ~(PAGE_SIZE - 1)) + offset, val, to_write);
+        val = (char*)val + to_write;
+        va = (char*)va + to_write;
+    }
 }
 
 
@@ -163,6 +203,7 @@ void myRead(void* va, void* val, int size) {
 int pageFault(pde_t* pgdir, void* va) {
     unsigned long va_num = (unsigned long)va;
     unsigned long vpn = va_num >> offset_bits;
+    unsigned long cur_page = 0;
     if (phys_bitmap.free_pages == 0) {
         if (!page_queue.head) return -1;
         unsigned long evict_vpn = queue_pop(&page_queue);
@@ -172,13 +213,13 @@ int pageFault(pde_t* pgdir, void* va) {
         pte_t* pt = (pte_t*)pgdir[evict_pde];
         unsigned long evict_ppn = pt[evict_pte] >> offset_bits;
         memcpy(disk + evict_vpn * PAGE_SIZE,
-               physical_memory + evict_ppn * PAGE_SIZE, PAGE_SIZE);
+            physical_memory + evict_ppn * PAGE_SIZE, PAGE_SIZE);
         pt[evict_pte] = 0;
         clearBitmap(&phys_bitmap, evict_ppn);
         clearBitmap(&virt_bitmap, evict_vpn);
         invalidateTLB((void*)evict_va);
+        cur_page = evict_ppn;
     }
-    unsigned long cur_page = 0;
     for (; cur_page < num_phys_pages; cur_page++) {
         if (!isBitmapSet(&phys_bitmap, cur_page)) break;
     }
@@ -192,11 +233,44 @@ int pageFault(pde_t* pgdir, void* va) {
 }
 
 pte_t* checkTLB(void* va) {
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (tlb.entry[i].valid && tlb.entry[i].v_page == ((unsigned long)va >> offset_bits)) {
+            return (pte_t*)(physical_memory + tlb.entry[i].p_page);
+        }
+    }
+    return NULL;
+}
 
+void findnext() {
+    bool isvalid = true;
+    int maxi = 0, maxetime = -1;
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (!tlb.entry[i].valid) {
+            if (!isvalid) continue;
+            isvalid = false;
+            maxi = i;
+        }
+        else {
+            tlb.entry[i].etime++;
+            if (!isvalid) continue;
+            if (tlb.entry[i].etime > maxetime) {
+                maxetime = tlb.entry[i].etime;
+                maxi = i;
+            }
+        }
+    }
+    tlb.next_replace = maxi;
 }
 
 int addTLB(void* va, void* pa) {
-
+    unsigned long vpn = (unsigned long)va >> offset_bits;
+    unsigned long ppn = (unsigned long)pa >> offset_bits;
+    tlb.entry[tlb.next_replace].valid = true;
+    tlb.entry[tlb.next_replace].v_page = vpn;
+    tlb.entry[tlb.next_replace].p_page = ppn << offset_bits;
+    tlb.entry[tlb.next_replace].etime = 0;
+    findnext();
+    return 0;
 }
 
 void invalidateTLB(void* va) {
@@ -206,4 +280,5 @@ void invalidateTLB(void* va) {
             tlb.entry[i].valid = false;
         }
     }
+    findnext();
 }

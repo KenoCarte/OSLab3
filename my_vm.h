@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 #include "defines.h"
 
@@ -33,9 +34,11 @@ typedef struct {
 		bool valid;  // valid bit
 		unsigned long v_page;  // virtual page number
 		unsigned long p_page;  // physical page number
+		int etime;
 	} entry[TLB_SIZE];
 	unsigned int tlb_accesses;
 	unsigned int tlb_misses;
+	int next_replace;
 } TLB;
 
 typedef struct {
@@ -110,6 +113,7 @@ int pageFault(pde_t* pgdir, void* va);
 pte_t* checkTLB(void* va);
 int addTLB(void* va, void* pa);
 void invalidateTLB(void* va);
+void findnext();
 
 void myFree(void* va, int size);
 void* myMalloc(unsigned int num_bytes);
