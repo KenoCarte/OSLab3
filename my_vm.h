@@ -66,6 +66,7 @@ typedef struct {
 void queue_init(queue* q);
 void queue_push(queue* q, unsigned long data);
 unsigned long queue_pop(queue* q);
+void queue_remove(queue* q, unsigned long data);
 
 
 void initMemoryAndDisk();
@@ -77,6 +78,11 @@ pte_t* checkTLB(void* va);
 int addTLB(void* va, void* pa);
 void invalidateTLB(void* va);
 void findnext();
+
+static inline unsigned long sanitizeVA(void* va) {
+	unsigned long mask = (ADDRESS_BITS >= 64) ? ~0UL : ((1ULL << ADDRESS_BITS) - 1ULL);
+	return ((unsigned long)va) & mask;
+}
 
 void myFree(void* va, int size);
 void* myMalloc(unsigned int num_bytes);

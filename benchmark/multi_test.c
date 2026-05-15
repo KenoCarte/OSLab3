@@ -12,7 +12,7 @@ int alloc_size = 5000;
 void mat_mult(void *mat1, void *mat2, int size, void *answer)
 {
 	int i, k, j, num1, num2, total;
-	unsigned int addr_mat1, addr_mat2, addr_ans;
+    unsigned int addr_mat1, addr_mat2, addr_ans;
 
 	if (!mat1 || !mat2 || !answer || size <= 0)
 		return;
