@@ -101,6 +101,6 @@ int main() {
         printf("free function works\n");
     else
         printf("free function does not work\n");
-
+    printTLBStats();
     return 0;
 }

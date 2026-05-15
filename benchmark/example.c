@@ -3,7 +3,7 @@
 #include "../my_vm.h"
 
 int main() {
-    int *ptr;
+    int* ptr;
     int x = 3;
     int y;
 
@@ -17,4 +17,6 @@ int main() {
     printf("After write, y=%d\n", y);
 
     myFree(ptr, sizeof(int));
+    printTLBStats();
+    return 0;
 }

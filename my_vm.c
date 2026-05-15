@@ -12,17 +12,64 @@ static unsigned long num_virt_pages;
 static char* physical_memory;
 static char* disk;
 static int is_initialized = 0;
+static pthread_mutex_t vm_mutex = PTHREAD_MUTEX_INITIALIZER;
 queue page_queue;
 const int offset_bits = log2(PAGE_SIZE);
 const int pde_bits = (ADDRESS_BITS - offset_bits) / 2;
 const int pte_bits = ADDRESS_BITS - offset_bits - pde_bits;
+
+void initBitmap(Bitmap* bitmap, unsigned long num_pages) {
+    bitmap->num_pages = num_pages;
+    bitmap->bitmap = (unsigned char*)calloc((num_pages + 7) / 8, sizeof(unsigned char));
+    bitmap->free_pages = num_pages;
+}
+void setBitmap(Bitmap* bitmap, unsigned long page_num) {
+    bitmap->bitmap[page_num / 8] |= (1 << (page_num % 8));
+    bitmap->free_pages--;
+}
+void clearBitmap(Bitmap* bitmap, unsigned long page_num) {
+    bitmap->bitmap[page_num / 8] &= ~(1 << (page_num % 8));
+    bitmap->free_pages++;
+}
+bool isBitmapSet(Bitmap* bitmap, unsigned long page_num) {
+    return (bitmap->bitmap[page_num / 8] & (1 << (page_num % 8))) != 0;
+}
+
+void queue_init(queue* q) {
+    q->head = NULL;
+    q->tail = NULL;
+}
+void queue_push(queue* q, unsigned long data) {
+    node* new_node = (node*)malloc(sizeof(node));
+    new_node->data = data;
+    new_node->next = NULL;
+    if (q->tail) {
+        q->tail->next = new_node;
+    }
+    else {
+        q->head = new_node;
+    }
+    q->tail = new_node;
+}
+unsigned long queue_pop(queue* q) {
+    if (q->head) {
+        node* temp = q->head;
+        unsigned long data = temp->data;
+        q->head = q->head->next;
+        free(temp);
+        if (!q->head) {
+            q->tail = NULL;
+        }
+        return data;
+    }
+    return 0;
+}
+
 /*
 Function responsible for allocating and setting your simulated physical memory and disk space
 */
 void initMemoryAndDisk() {
-
-    //Allocate physical memory and disk space using mmap or malloc; this is the total size of
-    //your memory/disk you are simulating
+    if (is_initialized) return;
     num_phys_pages = PM_SIZE / PAGE_SIZE;
     num_virt_pages = VM_SIZE / PAGE_SIZE;
     initBitmap(&phys_bitmap, num_phys_pages);
@@ -33,19 +80,13 @@ void initMemoryAndDisk() {
     disk = (char*)malloc(DISK_SIZE);
     queue_init(&page_queue);
     is_initialized = 1;
-    //HINT: Also calculate the number of physical and virtual pages and allocate
-    //virtual and physical bitmaps and initialize them
-
 }
-
-
 
 /*
 The function takes a virtual address and page directories starting address and
 performs translation to return the physical address
 */
 pte_t* translate(pde_t* pgdir, void* va) {
-    if (!is_initialized) initMemoryAndDisk();
     unsigned long va_num = (unsigned long)va;
     unsigned long pde_index = get_pde_bits(va_num, pde_bits);
     unsigned long pte_index = get_pte_bits(va_num, pte_bits, offset_bits);
@@ -66,7 +107,6 @@ pte_t* translate(pde_t* pgdir, void* va) {
     return (pte_t*)(physical_memory + pte + offset);
 }
 
-
 /*
 The function takes a page directory address, virtual address, physical address
 as an argument, and sets a page table entry. This function will walk the page
@@ -74,7 +114,6 @@ directory to see if there is an existing mapping for a virtual address. If the
 virtual address is not present, then a new entry will be added
 */
 int pageMap(pde_t* pgdir, void* va, void* pa) {
-    if (!is_initialized) initMemoryAndDisk();
     unsigned long va_num = (unsigned long)va;
     unsigned long pde_index = get_pde_bits(va_num, pde_bits);
     unsigned long pte_index = get_pte_bits(va_num, pte_bits, offset_bits);
@@ -89,14 +128,15 @@ int pageMap(pde_t* pgdir, void* va, void* pa) {
     return 0;
 }
 
-
 /* Function responsible for allocating pages
 and used by the benchmark
 */
 void* myMalloc(unsigned int num_bytes) {
-    if (!is_initialized) initMemoryAndDisk();
+    pthread_mutex_lock(&vm_mutex);
+    initMemoryAndDisk();
+
     unsigned int num_pages = (num_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (num_pages == 0) return NULL;
+    if (num_pages == 0) { pthread_mutex_unlock(&vm_mutex); return NULL; }
     unsigned long start_vpage = 0;
     unsigned int found = 0;
     for (unsigned long i = 0; i < num_virt_pages; i++) {
@@ -107,10 +147,12 @@ void* myMalloc(unsigned int num_bytes) {
             if (found == num_pages) break;
         }
     }
-    if (found < num_pages || phys_bitmap.free_pages < num_pages) return NULL;
+    if (found < num_pages || phys_bitmap.free_pages < num_pages) {
+        pthread_mutex_unlock(&vm_mutex); return NULL;
+    }
     unsigned long cur_page = 0;
-    for (unsigned int i = start_vpage;i < start_vpage + num_pages;i++) {
-        for (;cur_page < num_phys_pages;cur_page++) {
+    for (unsigned int i = start_vpage; i < start_vpage + num_pages; i++) {
+        for (; cur_page < num_phys_pages; cur_page++) {
             if (!isBitmapSet(&phys_bitmap, cur_page)) break;
         }
         setBitmap(&virt_bitmap, i);
@@ -122,15 +164,18 @@ void* myMalloc(unsigned int num_bytes) {
         queue_push(&page_queue, i);
         cur_page++;
     }
-    return (void*)(start_vpage << offset_bits);
+
+    void* result = (void*)(start_vpage << offset_bits);
+    pthread_mutex_unlock(&vm_mutex);
+    return result;
 }
 
 /* Responsible for releasing one or more memory pages using virtual address (va)
 */
 void myFree(void* va, int size) {
-    //Free the page table entries starting from this virtual address (va)
-    // Also mark the pages free in the bitmap
-    //Only free if the memory from "va" to va+size is valid
+    pthread_mutex_lock(&vm_mutex);
+    initMemoryAndDisk();
+
     unsigned long va_num = (unsigned long)va;
     unsigned long start_vpage = va_num >> offset_bits;
     unsigned int num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -138,6 +183,7 @@ void myFree(void* va, int size) {
         unsigned long vpage = start_vpage + i;
         if (!isBitmapSet(&virt_bitmap, vpage)) {
             printf("Segmentation Fault\n");
+            pthread_mutex_unlock(&vm_mutex);
             return;
         }
         invalidateTLB((void*)(vpage << offset_bits));
@@ -161,46 +207,57 @@ void myFree(void* va, int size) {
             page_directory[pde_index] = 0;
         }
     }
+    pthread_mutex_unlock(&vm_mutex);
 }
-
 
 /* The function copies data pointed by "val" to physical
  * memory pages using virtual address (va)
 */
 void myWrite(void* va, void* val, int size) {
-
-    /* HINT: Using the virtual address and translate(), find the physical page. Copy
-       the contents of "val" to a physical page. NOTE: The "size" value can be larger
-       than one page. Therefore, you may have to find multiple pages using translate()
-       function.*/
+    pthread_mutex_lock(&vm_mutex);
+    initMemoryAndDisk();
+    int num = size;
     while (size) {
-        unsigned long offset = (unsigned long)va & (PAGE_SIZE - 1);
-        unsigned long to_write = PAGE_SIZE - offset < size ? PAGE_SIZE - offset : size;
-        size -= to_write;
-        pte_t* pte = translate(page_directory, va);
-        if (!pte) {
-            printf("Segmentation Fault\n");
+        pte_t* phys = translate(page_directory, va);
+        if (!phys) {
+            printf("ERROR: Writing to unallocated address\n");
+            pthread_mutex_unlock(&vm_mutex);
             return;
         }
-        memcpy((char*)physical_memory + (*pte & ~(PAGE_SIZE - 1)) + offset, val, to_write);
+        unsigned long offset = (unsigned long)va & (PAGE_SIZE - 1);
+        unsigned long to_write = PAGE_SIZE - offset < size ? PAGE_SIZE - offset : size;
+        memcpy(phys, val, to_write);
+        size -= to_write;
         val = (char*)val + to_write;
         va = (char*)va + to_write;
     }
+    pthread_mutex_unlock(&vm_mutex);
 }
-
 
 /*Given a virtual address, this function copies the contents of the page to val*/
 void myRead(void* va, void* val, int size) {
+    pthread_mutex_lock(&vm_mutex);
+    initMemoryAndDisk();
 
-    /* HINT: put the values pointed to by "va" inside the physical memory at given
-    "val" address. Assume you can access "val" directly by derefencing them.
-    If you are implementing TLB,  always check first the presence of translation
-    in TLB before proceeding forward */
-
-
+    while (size) {
+        pte_t* phys = translate(page_directory, va);
+        if (!phys) {
+            printf("ERROR: Reading from unallocated address\n");
+            pthread_mutex_unlock(&vm_mutex);
+            return;
+        }
+        unsigned long offset = (unsigned long)va & (PAGE_SIZE - 1);
+        unsigned long to_read = PAGE_SIZE - offset < size ? PAGE_SIZE - offset : size;
+        memcpy(val, phys, to_read);
+        size -= to_read;
+        val = (char*)val + to_read;
+        va = (char*)va + to_read;
+    }
+    pthread_mutex_unlock(&vm_mutex);
 }
 
 int pageFault(pde_t* pgdir, void* va) {
+    
     unsigned long va_num = (unsigned long)va;
     unsigned long vpn = va_num >> offset_bits;
     unsigned long cur_page = 0;
@@ -212,8 +269,7 @@ int pageFault(pde_t* pgdir, void* va) {
         unsigned long evict_pte = get_pte_bits(evict_va, pte_bits, offset_bits);
         pte_t* pt = (pte_t*)pgdir[evict_pde];
         unsigned long evict_ppn = pt[evict_pte] >> offset_bits;
-        memcpy(disk + evict_vpn * PAGE_SIZE,
-            physical_memory + evict_ppn * PAGE_SIZE, PAGE_SIZE);
+        memcpy(disk + evict_vpn * PAGE_SIZE, physical_memory + evict_ppn * PAGE_SIZE, PAGE_SIZE);
         pt[evict_pte] = 0;
         clearBitmap(&phys_bitmap, evict_ppn);
         clearBitmap(&virt_bitmap, evict_vpn);
@@ -233,15 +289,18 @@ int pageFault(pde_t* pgdir, void* va) {
 }
 
 pte_t* checkTLB(void* va) {
+    
+    unsigned long offset = (unsigned long)va & (PAGE_SIZE - 1);
     for (int i = 0; i < TLB_SIZE; i++) {
         if (tlb.entry[i].valid && tlb.entry[i].v_page == ((unsigned long)va >> offset_bits)) {
-            return (pte_t*)(physical_memory + tlb.entry[i].p_page);
+            return (pte_t*)(physical_memory + tlb.entry[i].p_page + offset);
         }
     }
     return NULL;
 }
 
 void findnext() {
+    
     bool isvalid = true;
     int maxi = 0, maxetime = -1;
     for (int i = 0; i < TLB_SIZE; i++) {
@@ -263,6 +322,7 @@ void findnext() {
 }
 
 int addTLB(void* va, void* pa) {
+    
     unsigned long vpn = (unsigned long)va >> offset_bits;
     unsigned long ppn = (unsigned long)pa >> offset_bits;
     tlb.entry[tlb.next_replace].valid = true;
@@ -274,6 +334,7 @@ int addTLB(void* va, void* pa) {
 }
 
 void invalidateTLB(void* va) {
+    
     unsigned long vpn = (unsigned long)va >> offset_bits;
     for (int i = 0; i < TLB_SIZE; i++) {
         if (tlb.entry[i].valid && tlb.entry[i].v_page == vpn) {
@@ -281,4 +342,39 @@ void invalidateTLB(void* va) {
         }
     }
     findnext();
+}
+
+void cleanupMemoryAndDisk() {
+    pthread_mutex_lock(&vm_mutex);
+    if (!is_initialized) {
+        pthread_mutex_unlock(&vm_mutex);
+        return;
+    }
+    for (unsigned int i = 0; i < (1UL << pde_bits); i++) {
+        if (page_directory[i])
+            free((pte_t*)page_directory[i]);
+    }
+    free(page_directory);
+    free(phys_bitmap.bitmap);
+    free(virt_bitmap.bitmap);
+    free(physical_memory);
+    free(disk);
+    while (page_queue.head) {
+        node* tmp = page_queue.head;
+        page_queue.head = page_queue.head->next;
+        free(tmp);
+    }
+    is_initialized = 0;
+    pthread_mutex_unlock(&vm_mutex);
+}
+
+void printTLBStats() {
+    pthread_mutex_lock(&vm_mutex);
+    initMemoryAndDisk();
+    printf("TLB Accesses: %u\n", tlb.tlb_accesses);
+    printf("TLB Misses: %u\n", tlb.tlb_misses);
+    if (tlb.tlb_accesses > 0) {
+        printf("TLB Miss Rate: %.2f%%\n", (double)tlb.tlb_misses / tlb.tlb_accesses * 100);
+    }
+    pthread_mutex_unlock(&vm_mutex);
 }

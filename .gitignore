@@ -1,3 +1,7 @@
 .vscode/
 .git/
 .gitignore
+*.a
+*.o
+*.so
+*.dylib

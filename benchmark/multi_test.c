@@ -160,4 +160,6 @@ int main() {
     if (!flag) {
         printf("Some Problem with free!\n");
     }
+    printTLBStats();
+    return 0;
 }
