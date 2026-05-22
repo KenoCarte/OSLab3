@@ -70,7 +70,6 @@ void queue_remove(queue* q, unsigned long data);
 
 
 void initMemoryAndDisk();
-void cleanupMemoryAndDisk();
 pte_t* translate(pde_t* pgdir, void* va);
 int pageMap(pde_t* pgdir, void* va, void* pa);
 int pageFault(pde_t* pgdir, void* va);

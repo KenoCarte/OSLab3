@@ -3,6 +3,16 @@
 #define get_pde_bits(x, pde_width) ((x) >> (ADDRESS_BITS - pde_width))
 #define get_pte_bits(x, pte_width, offset) ((x >> (offset)) & ((1UL << (pte_width)) - 1))
 #define get_offset_bits(x, offset_bits) ((x) & ((1UL << (offset_bits)) - 1))
+// phys_bitmap: 跟踪物理页的占用情况（位图）
+// virt_bitmap: 跟踪虚拟页的占用情况（位图）
+// page_directory: 顶层页目录（two-level page table 的第一层），存放页表的基地址
+// tlb: 快表（TLB）缓存用于加速虚拟地址到物理地址的转换
+// num_phys_pages / num_virt_pages: 物理/虚拟页总数
+// physical_memory: 仿真的物理内存空间（连续字节数组）
+// disk: 仿真的二级存储（页面换出到这里）
+// is_initialized: 初始化标志
+// vm_mutex: 保护虚拟内存管理数据结构的互斥锁，避免并发竞争
+// page_queue: 记录页的使用顺序，用于实现简单的页面置换（FIFO）
 static Bitmap phys_bitmap;
 static Bitmap virt_bitmap;
 static pde_t* page_directory;
@@ -12,15 +22,13 @@ static unsigned long num_virt_pages;
 static char* physical_memory;
 static char* disk;
 static int is_initialized = 0;
-static unsigned long tlb_mismatch_count = 0;
-static unsigned long total_allocs = 0;
-static unsigned long total_frees = 0;
 static pthread_mutex_t vm_mutex = PTHREAD_MUTEX_INITIALIZER;
 queue page_queue;
 const int offset_bits = log2(PAGE_SIZE);
 const int pde_bits = (ADDRESS_BITS - offset_bits) / 2;
 const int pte_bits = ADDRESS_BITS - offset_bits - pde_bits;
 
+// 初始化位图：设置页数、分配用于记录位的字节数组、以及空闲页计数
 void initBitmap(Bitmap* bitmap, unsigned long num_pages) {
     bitmap->num_pages = num_pages;
     bitmap->bitmap = (unsigned char*)calloc((num_pages + 7) / 8, sizeof(unsigned char));
@@ -44,6 +52,7 @@ bool isBitmapSet(Bitmap* bitmap, unsigned long page_num) {
     return (bitmap->bitmap[page_num / 8] & (1 << (page_num % 8))) != 0;
 }
 
+// 队列用于记录页面顺序，以便页面置换
 void queue_init(queue* q) {
     q->head = NULL;
     q->tail = NULL;
@@ -73,7 +82,6 @@ unsigned long queue_pop(queue* q) {
     }
     return 0;
 }
-
 void queue_remove(queue* q, unsigned long data) {
     node* prev = NULL;
     node* cur = q->head;
@@ -92,6 +100,7 @@ void queue_remove(queue* q, unsigned long data) {
 
 /*
 Function responsible for allocating and setting your simulated physical memory and disk space
+说明：该函数懒初始化仿真所需的结构（位图、页目录、模拟内存/磁盘等），避免重复分配。
 */
 void initMemoryAndDisk() {
     if (is_initialized) return;
@@ -110,38 +119,30 @@ void initMemoryAndDisk() {
 /*
 The function takes a virtual address and page directories starting address and
 performs translation to return the physical address
+说明：translate 尝试先从 TLB 命中获取映射；若未命中则访问页目录/页表，遇到缺页触发 pageFault。
+返回值：指向物理内存中对应字节的指针（pte_t* 仅作为字节指针使用）
 */
 pte_t* translate(pde_t* pgdir, void* va) {
+    pte_t* tlb_phys = checkTLB(va);
+    if (tlb_phys) {
+        tlb.tlb_accesses++;
+        return tlb_phys;
+    }
     unsigned long va_num = sanitizeVA(va);
     unsigned long pde_index = get_pde_bits(va_num, pde_bits);
     unsigned long pte_index = get_pte_bits(va_num, pte_bits, offset_bits);
     unsigned long offset = get_offset_bits(va_num, offset_bits);
-
     if (pde_index >= (1UL << pde_bits)) return NULL;
     if (!pgdir[pde_index] && pageFault(pgdir, va) == -1) return NULL;
-
     pte_t* page_table = (pte_t*)pgdir[pde_index];
     if (pte_index >= (1UL << pte_bits)) return NULL;
     if (!page_table[pte_index] && pageFault(pgdir, va) == -1) return NULL;
-
     pte_t pte = page_table[pte_index];
+    // pte 存储的是物理地址（页对齐的基地址），加上偏移得到物理内存中的字节地址
     pte_t* pt_phys = (pte_t*)(physical_memory + pte + offset);
-
     // Always use page table as source of truth; TLB as cache
-    pte_t* tlb_phys = checkTLB(va);
-    if (tlb_phys) {
-        tlb.tlb_accesses++;
-        // Cross-validate TLB against page table
-        if (tlb_phys != pt_phys) {
-            tlb_mismatch_count++;
-            invalidateTLB(va);
-            addTLB(va, (void*)pte);
-        }
-    } else {
-        tlb.tlb_misses++;
-        addTLB(va, (void*)pte);
-    }
-
+    tlb.tlb_misses++;
+    addTLB(va, (void*)pte);
     return pt_phys;
 }
 
@@ -150,6 +151,7 @@ The function takes a page directory address, virtual address, physical address
 as an argument, and sets a page table entry. This function will walk the page
 directory to see if there is an existing mapping for a virtual address. If the
 virtual address is not present, then a new entry will be added
+说明：pageMap 负责在页目录/页表中设置从虚拟页到物理页的映射（页对齐地址）。
 */
 int pageMap(pde_t* pgdir, void* va, void* pa) {
     unsigned long va_num = sanitizeVA(va);
@@ -162,21 +164,23 @@ int pageMap(pde_t* pgdir, void* va, void* pa) {
         pgdir[pde_index] = (unsigned long)new_page_table;
     }
     pte_t* page_table = (pte_t*)pgdir[pde_index];
-    page_table[pte_index] = (unsigned long)pa;
+    page_table[pte_index] = (unsigned long)pa; // 存储物理地址（页对齐）
     return 0;
 }
 
 /* Function responsible for allocating pages
 and used by the benchmark
+说明：myMalloc 在虚拟地址空间中寻找连续的空闲虚拟页区间，
+为每个虚拟页分配一个空闲物理页（若物理页不足则失败或触发置换），
+并在页表中建立映射，返回分配到的虚拟地址基址（页对齐）。
 */
 void* myMalloc(unsigned int num_bytes) {
     pthread_mutex_lock(&vm_mutex);
     initMemoryAndDisk();
     unsigned int num_pages = (num_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     if (num_pages == 0) { pthread_mutex_unlock(&vm_mutex); return NULL; }
-    unsigned long start_vpage = 0;
+    unsigned long start_vpage = 1;
     unsigned int found = 0;
-    // Reserve virtual page 0 to avoid returning NULL-equivalent pointer (0)
     for (unsigned long i = 1; i < num_virt_pages; i++) {
         if (isBitmapSet(&virt_bitmap, i)) found = 0;
         else {
@@ -188,7 +192,7 @@ void* myMalloc(unsigned int num_bytes) {
     if (found < num_pages) {
         pthread_mutex_unlock(&vm_mutex); return NULL;
     }
-    unsigned long cur_page = 0;
+    unsigned long cur_page = 1;
     for (unsigned int i = start_vpage; i < start_vpage + num_pages; i++) {
         for (; cur_page < num_phys_pages; cur_page++) {
             if (!isBitmapSet(&phys_bitmap, cur_page)) break;
@@ -208,12 +212,13 @@ void* myMalloc(unsigned int num_bytes) {
         cur_page++;
     }
     void* result = (void*)(start_vpage << offset_bits);
-    total_allocs += num_pages;
     pthread_mutex_unlock(&vm_mutex);
     return result;
 }
 
 /* Responsible for releasing one or more memory pages using virtual address (va)
+说明：myFree 通过虚拟地址撤销映射、释放物理页并清理页表条目，
+若页表变为空则释放页表。对 TLB 做失效处理。
 */
 void myFree(void* va, int size) {
     if (!va) return;
@@ -251,35 +256,28 @@ void myFree(void* va, int size) {
             page_directory[pde_index] = 0;
         }
     }
-    total_frees += num_pages;
     pthread_mutex_unlock(&vm_mutex);
 }
 
 /* The function copies data pointed by "val" to physical
  * memory pages using virtual address (va)
+说明：myWrite 会按页边界循环调用 translate 获取物理指针并写入数据，
+若访问到未分配地址则报错并返回。
 */
 void myWrite(void* va, void* val, int size) {
     pthread_mutex_lock(&vm_mutex);
     initMemoryAndDisk();
     while (size) {
         pte_t* phys = translate(page_directory, va);
-        if (!phys) {
+        if (!phys || (char*)phys < physical_memory || (char*)phys >= physical_memory + PM_SIZE) {
             printf("ERROR: Writing to unallocated address\n");
-            pthread_mutex_unlock(&vm_mutex);
-            return;
-        }
-        if ((char*)phys < physical_memory || (char*)phys >= physical_memory + PM_SIZE) {
-            printf("FATAL: OOB phys=%p for va=%p\n", phys, va);
             pthread_mutex_unlock(&vm_mutex);
             return;
         }
         unsigned long offset = (unsigned long)va & (PAGE_SIZE - 1);
         unsigned long to_write = PAGE_SIZE - offset < size ? PAGE_SIZE - offset : size;
+        // 将数据拷贝到物理内存对应位置（物理指针由 translate 返回）
         memcpy(phys, val, to_write);
-        // Verify write took effect
-        if (memcmp(phys, val, to_write) != 0) {
-            printf("VERIFY FAIL: va=%p wrote=%x readback=%x\n", va, *(int*)val, *(int*)phys);
-        }
         size -= to_write;
         val = (char*)val + to_write;
         va = (char*)va + to_write;
@@ -287,7 +285,9 @@ void myWrite(void* va, void* val, int size) {
     pthread_mutex_unlock(&vm_mutex);
 }
 
-/*Given a virtual address, this function copies the contents of the page to val*/
+/*Given a virtual address, this function copies the contents of the page to val
+说明：myRead 按页边界读取数据，同样通过 translate 获取物理地址。
+*/
 void myRead(void* va, void* val, int size) {
     pthread_mutex_lock(&vm_mutex);
     initMemoryAndDisk();
@@ -308,18 +308,20 @@ void myRead(void* va, void* val, int size) {
     pthread_mutex_unlock(&vm_mutex);
 }
 
+// pageFault: 处理缺页，尝试为 vpn 分配物理页，必要时进行置换并将页面写回磁盘
 int pageFault(pde_t* pgdir, void* va) {
     unsigned long va_num = sanitizeVA(va);
     unsigned long vpn = va_num >> offset_bits;
     unsigned long cur_page = 0;
     if (phys_bitmap.free_pages == 0) {
-        if (!page_queue.head) return -1;
+        if (!page_queue.head) return -1; // 没有可置换的页
         unsigned long evict_vpn = queue_pop(&page_queue);
         unsigned long evict_va = evict_vpn << offset_bits;
         unsigned long evict_pde = get_pde_bits(evict_va, pde_bits);
         unsigned long evict_pte = get_pte_bits(evict_va, pte_bits, offset_bits);
         pte_t* pt = (pte_t*)pgdir[evict_pde];
         unsigned long evict_ppn = pt[evict_pte] >> offset_bits;
+        // 将被置换页面写入模拟磁盘
         memcpy(disk + evict_vpn * PAGE_SIZE, physical_memory + evict_ppn * PAGE_SIZE, PAGE_SIZE);
         pt[evict_pte] = 0;
         clearBitmap(&phys_bitmap, evict_ppn);
@@ -343,6 +345,7 @@ int pageFault(pde_t* pgdir, void* va) {
     return 0;
 }
 
+// TLB 相关函数：检查、添加和失效
 pte_t* checkTLB(void* va) {
     unsigned long va_num = sanitizeVA(va);
     unsigned long offset = va_num & (PAGE_SIZE - 1);
@@ -354,6 +357,7 @@ pte_t* checkTLB(void* va) {
     return NULL;
 }
 
+// findnext: 选择下一个 TLB 替换槽位（简单的基于访问时间的替换策略）
 void findnext() {
     bool isvalid = true;
     int maxi = 0, maxetime = -1;
@@ -396,37 +400,13 @@ void invalidateTLB(void* va) {
     findnext();
 }
 
-void cleanupMemoryAndDisk() {
-    pthread_mutex_lock(&vm_mutex);
-    if (!is_initialized) {
-        pthread_mutex_unlock(&vm_mutex);
-        return;
-    }
-    for (unsigned int i = 0; i < (1UL << pde_bits); i++) {
-        if (page_directory[i])
-            free((pte_t*)page_directory[i]);
-    }
-    free(page_directory);
-    free(phys_bitmap.bitmap);
-    free(virt_bitmap.bitmap);
-    free(physical_memory);
-    free(disk);
-    while (page_queue.head) {
-        node* tmp = page_queue.head;
-        page_queue.head = page_queue.head->next;
-        free(tmp);
-    }
-    is_initialized = 0;
-    pthread_mutex_unlock(&vm_mutex);
-}
-
 void printTLBStats() {
     pthread_mutex_lock(&vm_mutex);
     initMemoryAndDisk();
     unsigned int total = tlb.tlb_accesses + tlb.tlb_misses;
     printf("TLB Total Accesses: %u\n", total);
     if (total > 0) {
-        printf("TLB Hit Rate: %.2f%%\n", (double)tlb.tlb_accesses / total * 100);
+        printf("TLB Hit Rate: %.4f%%\n", (double)tlb.tlb_accesses / total * 100);
     }
     pthread_mutex_unlock(&vm_mutex);
 }

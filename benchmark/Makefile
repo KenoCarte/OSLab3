@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -L../ -lmy_vm -m32 -lm
 
-all: test
+all: test multi_test example
 
 test: ../libmy_vm.a
 	$(CC) test.c $(CFLAGS) -o test
